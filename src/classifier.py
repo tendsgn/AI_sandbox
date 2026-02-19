@@ -30,11 +30,10 @@ def classify_domain(record: dict) -> str:
             if keyword.lower() in text:
                 return domain_info["label"]
 
-    # Fallback: kijk in de zoekterm (Laag 3 bevat het domein al in het label)
+    # Fallback: kijk in de zoekterm (Laag 2 bevat het domein-keyword)
     label = record.get("gevonden_op_zoekterm", "")
-    if label.startswith("[domein]"):
-        # "[domein] luchtvaart + toezicht" → "luchtvaart"
-        domain_hint = label.replace("[domein]", "").split("+")[0].strip().lower()
+    if label.startswith("[keyword]"):
+        domain_hint = label.replace("[keyword]", "").strip().lower()
         for domain_info in ILT_DOMAINS.values():
             for keyword in domain_info["keywords"]:
                 if keyword.lower() in domain_hint:
@@ -74,17 +73,13 @@ def classify_ministerie_type(record: dict) -> str:
 def classify_search_layer(record: dict) -> str:
     """
     Registreer via welke zoeklaag de regeling is gevonden:
-      Laag 1 — directe ILT-verwijzing
-      Laag 2 — ministeriële toewijzing
-      Laag 3 — domein + taakconstructie
+      Laag 1 — overheid.authority (bevoegd ministerie)
+      Laag 2 — keyword (domein-trefwoord)
     """
     label = record.get("gevonden_op_zoekterm", "")
-    if label.startswith("[domein]"):
-        return "Laag 3 (domein+taak)"
-    lower = label.lower()
-    if any(x in lower for x in ["inspectie", "ilt", "rijksluchtvaartdienst", "vrom-inspectie"]):
-        return "Laag 1 (ILT-naam)"
-    return "Laag 2 (ministerie)"
+    if label.startswith("[keyword]"):
+        return "Laag 2 (keyword)"
+    return "Laag 1 (authority)"
 
 
 def classify_eu_grondslag(record: dict) -> bool:

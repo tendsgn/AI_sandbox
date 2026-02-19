@@ -4,21 +4,24 @@ ILT Wet- en Regelgeving Inventarisatie
 Inventariseert systematisch alle geldende wet- en regelgeving waarbij ILT
 of een van haar rechtsvoorgangers een taak heeft toebedeeld gekregen.
 
-Zoekstrategie (drie lagen):
-  Laag 1 — directe ILT-verwijzingen (naam van ILT of voorganger expliciet)
-  Laag 2 — ministeriële toewijzing (IenW / IenM / V&W / VROM + taakconstructie)
-  Laag 3 — domein + taakterm (vindt wetten die 'de Minister' noemen zonder naam)
+API: KOOP SRU — zoekservice.overheid.nl (Basis Wettenbestand)
+Documentatie: https://data.overheid.nl/dataset/basis-wetten-bestand
 
-De manco-analyse vergelijkt de complete inventarisatie vervolgens met bekende
-ILT-publicaties om te laten zien waar ILT aantoonbaar taken niet rapporteert.
+Zoekstrategie (twee lagen):
+  Laag 1 — overheid.authority: alle geldende regelgeving waarbij IenW of
+            een voorgangersministerie als bevoegd gezag is geregistreerd.
+  Laag 2 — keyword: aanvullende zoekslag per ILT-domein, pakt regelgeving
+            op die onder een ander ministerie valt maar waarbij ILT een rol heeft.
+
+De manco-analyse (additionele uitvoer) vergelijkt de inventarisatie met
+bekende ILT-publicaties om niet-gerapporteerde taken zichtbaar te maken.
 
 Gebruik:
-    python main.py [opties]
+    python main.py [--dry-run] [--layers 1 2] [--no-excel]
 
-Opties:
-    --dry-run         Voer alleen de eerste term per laag uit (test)
-    --layers 1 2 3    Welke zoeklagen gebruiken (default: alle drie)
-    --no-excel        Sla geen Excel op, alleen CSV
+    --dry-run     Test: voert slechts één query per laag uit
+    --layers      Welke lagen activeren (default: 1 2)
+    --no-excel    Sla geen Excel op, alleen CSV
 """
 
 import argparse
@@ -31,14 +34,13 @@ import pandas as pd
 from tqdm import tqdm
 
 from src.config import (
-    SEARCH_TERMS_ILT,
-    SEARCH_TERMS_MINISTERIES,
-    SEARCH_TERMS_DOMEINEN,
+    AUTHORITY_QUERIES,
+    KEYWORD_QUERIES,
     OUTPUT_CSV,
     OUTPUT_EXCEL,
     OUTPUT_GAPS,
 )
-from src.search import search_term, search_domain_pair
+from src.search import search
 from src.classifier import enrich_record
 from src.deduplicator import deduplicate
 from src.gap_analysis import load_reference, analyse_gaps, summarize_gaps
@@ -64,15 +66,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Voer alleen de eerste term per laag uit (test)",
+        help="Test: slechts één query per laag uitvoeren",
     )
     parser.add_argument(
         "--layers",
         nargs="+",
         type=int,
-        choices=[1, 2, 3],
-        default=[1, 2, 3],
-        help="Welke zoeklagen activeren (1=ILT, 2=ministeries, 3=domein+taak)",
+        choices=[1, 2],
+        default=[1, 2],
+        help="Welke zoeklagen activeren (1=authority, 2=keyword)",
     )
     parser.add_argument(
         "--no-excel",
@@ -83,50 +85,43 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_layer_1(dry_run: bool) -> list[dict]:
-    """Laag 1: directe ILT-verwijzingen."""
-    terms = SEARCH_TERMS_ILT[:1] if dry_run else SEARCH_TERMS_ILT
+    """
+    Laag 1: filter op verantwoordelijk ministerie (overheid.authority).
+    Geeft alle geldende wet/AMvB/MR terug voor IenW en voorgangers.
+    """
+    queries = AUTHORITY_QUERIES[:1] if dry_run else AUTHORITY_QUERIES
     records: list[dict] = []
-    logger.info("=== Laag 1: directe ILT-verwijzingen (%d termen) ===", len(terms))
-    for term in tqdm(terms, desc="Laag 1"):
+    logger.info("=== Laag 1: bevoegd gezag (%d queries) ===", len(queries))
+    for cql in tqdm(queries, desc="Laag 1"):
+        # Gebruik het ministerie zelf als leesbaar label
+        label = cql.replace('overheid.authority = ', '').strip('"')
         try:
-            for r in search_term(term):
+            for r in search(cql, label=f"[authority] {label}"):
                 records.append(r)
             time.sleep(0.5)
         except Exception as exc:
-            logger.error("Fout bij '%s': %s", term, exc)
-    logger.info("Laag 1: %d records", len(records))
+            logger.error("Fout bij '%s': %s", cql, exc)
+    logger.info("Laag 1: %d records (voor dedup)", len(records))
     return records
 
 
 def run_layer_2(dry_run: bool) -> list[dict]:
-    """Laag 2: ministeriële toewijzing."""
-    terms = SEARCH_TERMS_MINISTERIES[:1] if dry_run else SEARCH_TERMS_MINISTERIES
+    """
+    Laag 2: keyword-zoekopdrachten per ILT-domein.
+    Pakt regelgeving op die qua ministry buiten Laag 1 valt.
+    """
+    queries = KEYWORD_QUERIES[:1] if dry_run else KEYWORD_QUERIES
     records: list[dict] = []
-    logger.info("=== Laag 2: ministeriële toewijzing (%d termen) ===", len(terms))
-    for term in tqdm(terms, desc="Laag 2"):
+    logger.info("=== Laag 2: keyword per domein (%d queries) ===", len(queries))
+    for cql in tqdm(queries, desc="Laag 2"):
+        label = cql.replace('keyword = ', '').strip('"')
         try:
-            for r in search_term(term):
+            for r in search(cql, label=f"[keyword] {label}"):
                 records.append(r)
             time.sleep(0.5)
         except Exception as exc:
-            logger.error("Fout bij '%s': %s", term, exc)
-    logger.info("Laag 2: %d records", len(records))
-    return records
-
-
-def run_layer_3(dry_run: bool) -> list[dict]:
-    """Laag 3: domein + taakconstructie."""
-    pairs = SEARCH_TERMS_DOMEINEN[:1] if dry_run else SEARCH_TERMS_DOMEINEN
-    records: list[dict] = []
-    logger.info("=== Laag 3: domein + taakconstructie (%d combinaties) ===", len(pairs))
-    for domain_term, task_term in tqdm(pairs, desc="Laag 3"):
-        try:
-            for r in search_domain_pair(domain_term, task_term):
-                records.append(r)
-            time.sleep(0.5)
-        except Exception as exc:
-            logger.error("Fout bij ('%s', '%s'): %s", domain_term, task_term, exc)
-    logger.info("Laag 3: %d records", len(records))
+            logger.error("Fout bij '%s': %s", cql, exc)
+    logger.info("Laag 2: %d records (voor dedup)", len(records))
     return records
 
 
@@ -139,50 +134,45 @@ def main() -> None:
         all_raw.extend(run_layer_1(args.dry_run))
     if 2 in args.layers:
         all_raw.extend(run_layer_2(args.dry_run))
-    if 3 in args.layers:
-        all_raw.extend(run_layer_3(args.dry_run))
 
     logger.info("Totaal gevonden (voor dedup): %d", len(all_raw))
 
     if not all_raw:
         logger.warning(
-            "Geen resultaten gevonden. Controleer verbinding met wetten.overheid.nl."
+            "Geen resultaten. Controleer verbinding en API-endpoint.\n"
+            "Tip: voer 'python diagnose.py' uit om de API te testen."
         )
         return
 
-    # --- Deduplicatie ---
+    # Deduplicatie
     unique = deduplicate(all_raw)
 
-    # --- Classificatie ---
+    # Classificatie
     enriched = [enrich_record(r) for r in unique]
     inventory_df = pd.DataFrame(enriched)
 
-    # --- Manco-analyse (additioneel, niet het hoofdproduct) ---
+    # Samenvatting per domein
+    per_domein = inventory_df.groupby("ilt_domein").size().sort_values(ascending=False)
+    logger.info("=== Regelingen per domein (na dedup) ===")
+    for domein, n in per_domein.items():
+        logger.info("  %-35s %d", domein, n)
+
+    # Manco-analyse (additioneel)
     known_ids = load_reference()
     gap_df = analyse_gaps(inventory_df, known_ids)
-
     summary = summarize_gaps(gap_df)
-    logger.info("=== Samenvatting ===")
+    logger.info("=== Manco-samenvatting ===")
     logger.info("  Totaal unieke regelingen: %d", summary["totaal_gevonden"])
     logger.info("  Gedekt in ILT-referentie: %d", summary["gedekt"])
     logger.info("  Ongedekte taken:          %d", summary["ongedekte_taak"])
     logger.info("  Slapende bevoegdheden:    %d", summary["slapende_bevoegdheid"])
     logger.info("  Verouderde wettekst:      %d", summary["verouderde_wettekst"])
 
-    per_domein = gap_df.groupby("ilt_domein").size().sort_values(ascending=False)
-    logger.info("=== Regelingen per domein ===")
-    for domein, n in per_domein.items():
-        logger.info("  %-35s %d", domein, n)
-
-    # --- Output ---
-    # Primaire output: de volledige inventarisatie
+    # Output
     save_csv(gap_df, OUTPUT_CSV)
-
-    # Secundaire output: alleen manco's
     if "manco_categorie" in gap_df.columns:
         manco_df = gap_df[gap_df["manco_categorie"] != "gedekt"]
         save_csv(manco_df, OUTPUT_GAPS)
-
     if not args.no_excel:
         save_excel(gap_df, OUTPUT_EXCEL)
 
