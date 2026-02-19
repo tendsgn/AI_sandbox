@@ -34,7 +34,6 @@ from src.config import (
     SRU_MAX_RECORDS,
     REQUEST_DELAY_SEC,
     GELDEND_FILTER,
-    TYPE_FILTER,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,13 +103,12 @@ def search(cql_condition: str, label: str) -> Iterator[dict]:
     cql_condition: het specifieke zoekcriterium zonder geldend-filter,
                    bijv. 'overheid.authority = "Infrastructuur en Waterstaat"'
     label:         beschrijving voor logging en output-kolom
+
+    Noot: TYPE_FILTER is bewust weggelaten uit de API-query. De BWB
+    geeft ook 'onbekend' of gecombineerde typen terug. Type-filtering
+    vindt post-hoc plaats in de classifier op basis van soort_regeling.
     """
-    # Combineer altijd met geldend-filter én type-filter
-    full_query = (
-        f"({cql_condition})"
-        f" AND ({GELDEND_FILTER})"
-        f" AND ({TYPE_FILTER})"
-    )
+    full_query = f"({cql_condition}) AND ({GELDEND_FILTER})"
     yield from _paginate(full_query, label=label)
 
 
@@ -160,7 +158,9 @@ def _request(cql_query: str, start_record: int = 1) -> ET.Element:
         "query":          cql_query,
         "startRecord":    start_record,
         "maximumRecords": SRU_MAX_RECORDS,
-        "recordSchema":   "gzd",
+        # recordSchema weggelaten: server gebruikt standaardschema.
+        # Dit vermijdt fout 1/67 bij niet-ondersteunde schema's.
+        # Zie diagnose.py om te achterhalen welk schema de server retourneert.
     }
     resp = requests.get(SRU_BASE_URL, params=params, timeout=30)
     resp.raise_for_status()
@@ -260,12 +260,9 @@ def diagnose(cql_condition: str) -> dict:
     """
     Hulpfunctie om één query te testen zonder te pagineren.
     Geeft ruwe response-info terug voor debugging.
+    Gebruik liever het standalone diagnose.py voor uitgebreidere tests.
     """
-    full_query = (
-        f"({cql_condition})"
-        f" AND ({GELDEND_FILTER})"
-        f" AND ({TYPE_FILTER})"
-    )
+    full_query = f"({cql_condition}) AND ({GELDEND_FILTER})"
     params = {
         "operation":      "searchRetrieve",
         "version":        SRU_VERSION,
@@ -273,7 +270,6 @@ def diagnose(cql_condition: str) -> dict:
         "query":          full_query,
         "startRecord":    1,
         "maximumRecords": 1,
-        "recordSchema":   "gzd",
     }
     resp = requests.get(SRU_BASE_URL, params=params, timeout=30)
     root = ET.fromstring(resp.content)
@@ -285,8 +281,8 @@ def diagnose(cql_condition: str) -> dict:
         first_parsed = _parse(records[0], label="diagnose")
 
     return {
-        "status_code":   resp.status_code,
-        "total_results": total,
-        "first_record":  first_parsed,
+        "status_code":     resp.status_code,
+        "total_results":   total,
+        "first_record":    first_parsed,
         "raw_xml_snippet": resp.text[:2000],
     }
