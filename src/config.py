@@ -28,16 +28,14 @@ SRU_CONNECTION    = "BWB"
 SRU_MAX_RECORDS   = 50       # API-maximum is 50
 REQUEST_DELAY_SEC = 1.0      # respectvol crawlen
 
-# CQL-filter: alleen geldende regelgeving
-GELDEND_FILTER = 'overheidbwb.geldigheidsstatus = "geldend"'
-
-# Regelsoorten die relevant zijn voor ILT (CQL OR-combinatie)
-TYPE_FILTER = (
-    'dcterms.type = "wet" OR '
-    'dcterms.type = "AMvB" OR '
-    'dcterms.type = "ministeriele-regeling" OR '
-    'dcterms.type = "KB"'
-)
+# Noot: overheidbwb.geldigheidsstatus bestaat NIET als CQL-index (fout 1/16).
+# Geldend-filtering vindt post-hoc plaats in search.py op basis van het veld
+# overheidbwb:geldigheidsperiode_einddatum uit de XML-response:
+#   geldend  ↔  einddatum = "9999-12-31"
+#
+# Noot: dcterms.type is wel een geldig CQL-index, maar de exacte typewaarden
+# zijn "wet", "AMvB", "ministeriele-regeling", "KB" — identiek aan wat de XML
+# retourneert. Type-filtering vindt post-hoc plaats in de classifier.
 
 # ===========================================================================
 # LAAG 1 — Ministeries als bevoegd gezag (overheid.authority)

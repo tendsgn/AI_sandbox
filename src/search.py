@@ -4,20 +4,37 @@ Zoekmodule: bevraagt de KOOP SRU API voor het Basis Wettenbestand (BWB).
 Eindpunt:  https://zoekservice.overheid.nl/sru/Search
 Protocol:  SRU 1.2
 Collectie: BWB (Basis Wettenbestand)
-Formaat:   XML (SRW/SRU response, recordschema: gzd)
+Formaat:   XML (GZD-schema, standaard server-response zonder recordSchema-param)
+
+Namespaces in de response (geverifieerd via explain + stap-2-query):
+  SRW:         http://www.loc.gov/zing/srw/
+  GZD:         http://standaarden.overheid.nl/sru
+  dcterms:     http://purl.org/dc/terms/
+  overheid:    http://standaarden.overheid.nl/owms/terms/
+  overheidbwb: http://standaarden.overheid.nl/bwb/terms/
+
+XML-structuur per record:
+  srw:record / srw:recordData / gzd:gzd / gzd:originalData
+    / overheidbwb:meta / owmskern
+      dcterms:identifier, dcterms:title, dcterms:type, dcterms:creator,
+      overheid:authority, dcterms:modified
+    / owmsmantel
+      dcterms:created
+    / bwbipm
+      overheidbwb:geldigheidsperiode_startdatum
+      overheidbwb:geldigheidsperiode_einddatum   ← "9999-12-31" = geldend
 
 Beperkingen:
   - Zoekt ALLEEN op metadata, niet op wettekst.
   - Maximaal 50 records per request.
-  - Alle velden zijn CQL (Contextual Query Language).
+  - overheidbwb.geldigheidsstatus bestaat NIET als CQL-index (fout 1/16).
+    Geldend-filtering vindt post-hoc plaats op geldigheidsperiode_einddatum.
 
-Bruikbare CQL-velden (BWB):
-  overheid.authority          Verantwoordelijk ministerie
-  overheidbwb.geldigheidsstatus  'geldend' / 'niet-geldend'
-  dcterms.type                wet / AMvB / ministeriele-regeling / KB
-  dcterms.title               Titel (gedeeltelijk)
-  keyword                     Metadata-trefwoorden
-  dcterms.identifier          BWB-identifier (exact)
+Bruikbare CQL-velden (BWB, geverifieerd via explain):
+  overheid.authority    Verantwoordelijk ministerie
+  dcterms.type          wet / AMvB / ministeriele-regeling / KB
+  dcterms.identifier    BWB-identifier (exact)
+  dcterms.modified      Datum laatste wijziging
 """
 
 import time
@@ -33,63 +50,24 @@ from src.config import (
     SRU_CONNECTION,
     SRU_MAX_RECORDS,
     REQUEST_DELAY_SEC,
-    GELDEND_FILTER,
 )
 
 logger = logging.getLogger(__name__)
 
-# Namespaces die voorkomen in SRU/GZD-responses van zoekservice.overheid.nl
-# We proberen meerdere varianten omdat de exacte namespace kan variëren.
-NS_CANDIDATES = [
-    {   # Meest voorkomend voor KOOP SRU
-        "srw":          "http://www.loc.gov/zing/srw/",
-        "dcterms":      "http://purl.org/dc/terms/",
-        "overheidbwb":  "http://standaarden.overheid.nl/bwb/",
-        "overheid":     "http://standaarden.overheid.nl/owms/terms/",
-        "gzd":          "http://www.gzd.nl/",
-    },
-    {   # Alternatieve variant
-        "srw":          "http://www.loc.gov/zing/srw/",
-        "dcterms":      "http://purl.org/dc/terms/",
-        "overheidbwb":  "http://standaarden.overheid.nl/bwb/",
-    },
-]
-
-# Velden om uit elk record te extraheren, met mogelijke namespace-varianten
-FIELD_XPATHS = {
-    "bwb_id": [
-        ".//dcterms:identifier",
-        ".//{http://purl.org/dc/terms/}identifier",
-        ".//{http://www.gzd.nl/}identifier",
-    ],
-    "titel": [
-        ".//dcterms:title",
-        ".//{http://purl.org/dc/terms/}title",
-        ".//{http://www.gzd.nl/}title",
-    ],
-    "citeertitel": [
-        ".//dcterms:alternative",
-        ".//{http://purl.org/dc/terms/}alternative",
-    ],
-    "soort_regeling": [
-        ".//dcterms:type",
-        ".//{http://purl.org/dc/terms/}type",
-    ],
-    "datum_inwerkingtreding": [
-        ".//overheidbwb:datumInwerkingtreding",
-        ".//{http://standaarden.overheid.nl/bwb/}datumInwerkingtreding",
-    ],
-    "status": [
-        ".//overheidbwb:geldigheidsstatus",
-        ".//{http://standaarden.overheid.nl/bwb/}geldigheidsstatus",
-    ],
-    "wetgever": [
-        ".//dcterms:creator",
-        ".//{http://purl.org/dc/terms/}creator",
-        ".//dcterms:publisher",
-        ".//{http://purl.org/dc/terms/}publisher",
-    ],
+# Exacte namespace-URIs zoals teruggegeven door de server (geverifieerd via diagnose.py)
+_NS = {
+    "srw":          "http://www.loc.gov/zing/srw/",
+    "gzd":          "http://standaarden.overheid.nl/sru",
+    "dcterms":      "http://purl.org/dc/terms/",
+    "overheid":     "http://standaarden.overheid.nl/owms/terms/",
+    "overheidbwb":  "http://standaarden.overheid.nl/bwb/terms/",
 }
+
+# Vaste tag-strings (Clark-notatie) voor veelgebruikte elementen
+_T = {k: "{" + v + "}" for k, v in _NS.items()}
+
+# Datum-sentinel voor open-einde geldigheid
+_OPEN_EINDDATUM = "9999-12-31"
 
 
 # ---------------------------------------------------------------------------
@@ -98,18 +76,17 @@ FIELD_XPATHS = {
 
 def search(cql_condition: str, label: str) -> Iterator[dict]:
     """
-    Voer een CQL-zoekopdracht uit op het BWB en yield records.
+    Voer een CQL-zoekopdracht uit op het BWB en yield geldende records.
 
-    cql_condition: het specifieke zoekcriterium zonder geldend-filter,
+    cql_condition: het specifieke zoekcriterium,
                    bijv. 'overheid.authority = "Infrastructuur en Waterstaat"'
     label:         beschrijving voor logging en output-kolom
 
-    Noot: TYPE_FILTER is bewust weggelaten uit de API-query. De BWB
-    geeft ook 'onbekend' of gecombineerde typen terug. Type-filtering
-    vindt post-hoc plaats in de classifier op basis van soort_regeling.
+    Geldend-filtering (overheidbwb.geldigheidsstatus bestaat niet als CQL-index)
+    vindt post-hoc plaats: alleen records met geldigheidsperiode_einddatum =
+    "9999-12-31" worden doorgegeven.
     """
-    full_query = f"({cql_condition}) AND ({GELDEND_FILTER})"
-    yield from _paginate(full_query, label=label)
+    yield from _paginate(cql_condition, label=label)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +94,7 @@ def search(cql_condition: str, label: str) -> Iterator[dict]:
 # ---------------------------------------------------------------------------
 
 def _paginate(cql_query: str, label: str) -> Iterator[dict]:
-    """Voer een volledige query uit, inclusief automatische paginering."""
+    """Voer een volledige query uit inclusief automatische paginering."""
     logger.info("Zoeken: %s", label)
     try:
         root = _request(cql_query, start_record=1)
@@ -126,13 +103,15 @@ def _paginate(cql_query: str, label: str) -> Iterator[dict]:
         return
 
     total = _get_total(root)
-    logger.info("  -> %d resultaten", total)
+    logger.info("  -> %d resultaten (voor geldend-filter)", total)
     if total == 0:
         return
 
+    yielded = 0
     for rec in _get_records(root):
         parsed = _parse(rec, label)
         if parsed:
+            yielded += 1
             yield parsed
 
     start = SRU_MAX_RECORDS + 1
@@ -146,11 +125,21 @@ def _paginate(cql_query: str, label: str) -> Iterator[dict]:
         for rec in _get_records(root):
             parsed = _parse(rec, label)
             if parsed:
+                yielded += 1
                 yield parsed
         start += SRU_MAX_RECORDS
 
+    logger.info("  -> %d geldende records doorgegeven", yielded)
+
 
 def _request(cql_query: str, start_record: int = 1) -> ET.Element:
+    """
+    Stuur één SRU searchRetrieve-request.
+
+    recordSchema wordt NIET meegegeven: de server geeft dan standaard GZD-XML
+    terug. recordSchema=gzd veroorzaakte fout 1/67 (schema known but record
+    cannot be transformed).
+    """
     params = {
         "operation":      "searchRetrieve",
         "version":        SRU_VERSION,
@@ -158,9 +147,6 @@ def _request(cql_query: str, start_record: int = 1) -> ET.Element:
         "query":          cql_query,
         "startRecord":    start_record,
         "maximumRecords": SRU_MAX_RECORDS,
-        # recordSchema weggelaten: server gebruikt standaardschema.
-        # Dit vermijdt fout 1/67 bij niet-ondersteunde schema's.
-        # Zie diagnose.py om te achterhalen welk schema de server retourneert.
     }
     resp = requests.get(SRU_BASE_URL, params=params, timeout=30)
     resp.raise_for_status()
@@ -169,84 +155,69 @@ def _request(cql_query: str, start_record: int = 1) -> ET.Element:
 
 def _get_total(root: ET.Element) -> int:
     """Lees numberOfRecords uit de SRU-response."""
-    # Probeer met en zonder namespace
-    for tag in [
-        "{http://www.loc.gov/zing/srw/}numberOfRecords",
-        "numberOfRecords",
-    ]:
-        el = root.find(".//" + tag)
-        if el is not None and el.text:
-            try:
-                return int(el.text.strip())
-            except ValueError:
-                pass
+    el = root.find(f".//{_T['srw']}numberOfRecords")
+    if el is not None and el.text:
+        try:
+            return int(el.text.strip())
+        except ValueError:
+            pass
     return 0
 
 
 def _get_records(root: ET.Element) -> list[ET.Element]:
-    """Geef alle record-elementen in de response."""
-    for tag in [
-        "{http://www.loc.gov/zing/srw/}record",
-        "record",
-    ]:
-        records = root.findall(".//" + tag)
-        if records:
-            return records
-    return []
+    """Geef alle srw:record-elementen in de response."""
+    return root.findall(f".//{_T['srw']}record")
 
 
-def _find_text(element: ET.Element, xpaths: list[str]) -> str:
-    """Probeer meerdere XPath-varianten tot een waarde gevonden is."""
-    for xpath in xpaths:
-        try:
-            el = element.find(xpath)
-            if el is not None and el.text:
-                return el.text.strip()
-        except Exception:
-            continue
+def _txt(element: ET.Element, clark_tag: str) -> str:
+    """Geef de tekstinhoud van het eerste overeenkomende element, of ''."""
+    el = element.find(".//" + clark_tag)
+    if el is not None and el.text:
+        return el.text.strip()
     return ""
 
 
 def _parse(record: ET.Element, label: str) -> dict | None:
-    """Extraheer metadata uit één SRU-record."""
+    """
+    Extraheer metadata uit één SRU-record en pas geldend-filter toe.
+
+    Retourneert None als:
+    - recordData niet gevonden
+    - bwb_id én titel ontbreken
+    - geldigheidsperiode_einddatum != "9999-12-31" (niet meer geldend)
+    """
     try:
-        # Zoek de recordData (met of zonder namespace)
-        data = None
-        for tag in [
-            "{http://www.loc.gov/zing/srw/}recordData",
-            "recordData",
-        ]:
-            data = record.find(".//" + tag)
-            if data is not None:
-                break
-
+        data = record.find(f".//{_T['srw']}recordData")
         if data is None:
-            # Gebruik het record zelf als fallback
-            data = record
+            return None
 
-        bwb_id          = _find_text(data, FIELD_XPATHS["bwb_id"])
-        titel           = _find_text(data, FIELD_XPATHS["titel"])
-        citeertitel     = _find_text(data, FIELD_XPATHS["citeertitel"])
-        soort_regeling  = _find_text(data, FIELD_XPATHS["soort_regeling"])
-        datum_iwtrd     = _find_text(data, FIELD_XPATHS["datum_inwerkingtreding"])
-        status          = _find_text(data, FIELD_XPATHS["status"])
-        wetgever        = _find_text(data, FIELD_XPATHS["wetgever"])
+        bwb_id         = _txt(data, _T["dcterms"] + "identifier")
+        titel          = _txt(data, _T["dcterms"] + "title")
+        soort_regeling = _txt(data, _T["dcterms"] + "type")
+        wetgever       = _txt(data, _T["dcterms"] + "creator")
+        authority      = _txt(data, _T["overheid"] + "authority")
+        datum_modified = _txt(data, _T["dcterms"] + "modified")
+        datum_created  = _txt(data, _T["dcterms"] + "created")
+        einddatum      = _txt(data, _T["overheidbwb"] + "geldigheidsperiode_einddatum")
+        startdatum     = _txt(data, _T["overheidbwb"] + "geldigheidsperiode_startdatum")
 
-        # BWB-URL
-        url = f"https://wetten.overheid.nl/{bwb_id}" if bwb_id else ""
+        # Post-hoc geldend-filter: alleen open-einde records
+        if einddatum and einddatum != _OPEN_EINDDATUM:
+            return None
 
-        # Sla records zonder titel én zonder ID over
         if not titel and not bwb_id:
             return None
+
+        url = f"https://wetten.overheid.nl/{bwb_id}" if bwb_id else ""
 
         return {
             "bwb_id":                 bwb_id,
             "titel":                  titel,
-            "citeertitel":            citeertitel,
             "soort_regeling":         soort_regeling,
-            "datum_inwerkingtreding": datum_iwtrd,
-            "status":                 status,
             "wetgever":               wetgever,
+            "authority":              authority,
+            "datum_inwerkingtreding": datum_created or startdatum,
+            "datum_gewijzigd":        datum_modified,
             "url":                    url,
             "gevonden_op_zoekterm":   label,
         }
@@ -259,15 +230,13 @@ def _parse(record: ET.Element, label: str) -> dict | None:
 def diagnose(cql_condition: str) -> dict:
     """
     Hulpfunctie om één query te testen zonder te pagineren.
-    Geeft ruwe response-info terug voor debugging.
-    Gebruik liever het standalone diagnose.py voor uitgebreidere tests.
+    Gebruik het standalone diagnose.py voor uitgebreidere stap-voor-stap tests.
     """
-    full_query = f"({cql_condition}) AND ({GELDEND_FILTER})"
     params = {
         "operation":      "searchRetrieve",
         "version":        SRU_VERSION,
         "x-connection":   SRU_CONNECTION,
-        "query":          full_query,
+        "query":          cql_condition,
         "startRecord":    1,
         "maximumRecords": 1,
     }
