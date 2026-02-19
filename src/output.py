@@ -1,5 +1,10 @@
 """
 Output module: schrijft resultaten naar CSV en Excel.
+
+Excel-structuur (drie tabs):
+  1. Inventarisatie  — de volledige lijst van gevonden regelgeving
+  2. Domeinoverzicht — tellingen per ILT-domein en soort regeling
+  3. Manco analyse   — alleen de niet-gedekte regelgeving
 """
 
 import logging
@@ -9,7 +14,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Kolomvolgorde voor export
+# Kolomvolgorde voor de inventarisatie-export
 EXPORT_COLUMNS = [
     "bwb_id",
     "titel",
@@ -23,21 +28,10 @@ EXPORT_COLUMNS = [
     "status",
     "url",
     "gevonden_op_zoektermen",
+    "gevonden_via_laag",
     "manco_categorie",
     "manco_toelichting",
 ]
-
-# Domeinkleur voor Excel-opmaak
-DOMAIN_COLORS = {
-    "Luchtvaart":                    "BDD7EE",
-    "Scheepvaart":                   "DDEBF7",
-    "Rail":                          "E2EFDA",
-    "Wegvervoer":                    "FFF2CC",
-    "Gevaarlijke stoffen":           "FCE4D6",
-    "Milieu & Leefomgeving":         "D9D2E9",
-    "Bouw & Producten":              "F4CCCC",
-    "Onbekend / nader te bepalen":   "F2F2F2",
-}
 
 MANCO_COLORS = {
     "gedekt":               "C6EFCE",
@@ -55,32 +49,77 @@ def save_csv(df: pd.DataFrame, path: str) -> None:
     logger.info("CSV opgeslagen: %s (%d rijen)", output_path, len(df))
 
 
-def save_excel(df: pd.DataFrame, gap_df: pd.DataFrame, path: str) -> None:
+def save_excel(df: pd.DataFrame, path: str) -> None:
     """
-    Schrijf een Excel-bestand met twee tabs:
-    - 'Inventarisatie': alle gevonden regelgeving
-    - 'Manco analyse': alleen de niet-gedekte regelgeving, gesorteerd op categorie
+    Schrijf Excel met drie tabs:
+    1. Inventarisatie  — volledige inventarisatie
+    2. Domeinoverzicht — statistieken per domein
+    3. Manco analyse   — alleen niet-gedekte regelgeving
     """
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     cols = [c for c in EXPORT_COLUMNS if c in df.columns]
-    gap_cols = [c for c in EXPORT_COLUMNS if c in gap_df.columns]
+    mancos = df[df.get("manco_categorie", pd.Series()) != "gedekt"]
+    if "manco_categorie" in df.columns:
+        mancos = df[df["manco_categorie"] != "gedekt"].sort_values(
+            ["manco_categorie", "ilt_domein"]
+        )
+    manco_cols = [c for c in EXPORT_COLUMNS if c in mancos.columns]
 
-    mancos = gap_df[gap_df["manco_categorie"] != "gedekt"].sort_values(
-        ["manco_categorie", "ilt_domein"]
-    )
+    domain_summary = _build_domain_summary(df)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         df[cols].to_excel(writer, sheet_name="Inventarisatie", index=False)
-        mancos[gap_cols].to_excel(writer, sheet_name="Manco analyse", index=False)
-        _apply_excel_formatting(writer)
+        domain_summary.to_excel(writer, sheet_name="Domeinoverzicht", index=False)
+        mancos[manco_cols].to_excel(writer, sheet_name="Manco analyse", index=False)
+        _apply_formatting(writer, df)
 
     logger.info("Excel opgeslagen: %s", output_path)
 
 
-def _apply_excel_formatting(writer: pd.ExcelWriter) -> None:
-    """Pas basisopmaak toe op beide sheets."""
+def _build_domain_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Bouw een overzichtstabel per ILT-domein:
+    - Totaal aantal regelingen
+    - Uitsplitsing per soort (wet, AMvB, ministeriële regeling, overig)
+    - Uitsplitsing per taaktype
+    - Aantal manco's per categorie
+    """
+    if "ilt_domein" not in df.columns:
+        return pd.DataFrame()
+
+    rows = []
+    for domein in sorted(df["ilt_domein"].unique()):
+        sub = df[df["ilt_domein"] == domein]
+
+        soorten = sub["soort_regeling"].value_counts().to_dict() if "soort_regeling" in sub else {}
+
+        mancos = {}
+        if "manco_categorie" in sub.columns:
+            mancos = sub["manco_categorie"].value_counts().to_dict()
+
+        rows.append({
+            "ilt_domein":            domein,
+            "totaal_regelingen":     len(sub),
+            "wet":                   soorten.get("wet", 0),
+            "amvb":                  soorten.get("AMvB", soorten.get("amvb", 0)),
+            "min_regeling":          soorten.get("ministeriële regeling",
+                                                  soorten.get("MR", 0)),
+            "overig":                sum(
+                v for k, v in soorten.items()
+                if k.lower() not in ("wet", "amvb", "ministeriële regeling", "mr")
+            ),
+            "gedekt":                mancos.get("gedekt", 0),
+            "ongedekte_taak":        mancos.get("ongedekte_taak", 0),
+            "slapende_bevoegdheid":  mancos.get("slapende_bevoegdheid", 0),
+            "verouderde_wettekst":   mancos.get("verouderde_wettekst", 0),
+        })
+
+    return pd.DataFrame(rows).sort_values("totaal_regelingen", ascending=False)
+
+
+def _apply_formatting(writer: pd.ExcelWriter, df: pd.DataFrame) -> None:
     try:
         from openpyxl.styles import Font, PatternFill, Alignment
         from openpyxl.utils import get_column_letter
@@ -88,20 +127,20 @@ def _apply_excel_formatting(writer: pd.ExcelWriter) -> None:
         for sheet_name in writer.sheets:
             ws = writer.sheets[sheet_name]
 
-            # Header vet + bevroren
+            # Header vet + bevroren rij
             for cell in ws[1]:
                 cell.font = Font(bold=True)
                 cell.alignment = Alignment(wrap_text=True)
             ws.freeze_panes = "A2"
 
-            # Kolombreedte automatisch aanpassen (max 60 tekens)
+            # Auto-breedte (max 60)
             for col_idx, col in enumerate(ws.columns, 1):
                 max_len = max(
                     (len(str(cell.value or "")) for cell in col), default=10
                 )
                 ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 60)
 
-            # Rijkleuring op manco_categorie (sheet 'Manco analyse')
+            # Rijkleuring op manco_categorie voor manco-tab
             if sheet_name == "Manco analyse":
                 header = [cell.value for cell in ws[1]]
                 if "manco_categorie" in header:
